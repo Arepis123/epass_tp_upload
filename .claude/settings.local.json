@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(pip install:*)",
+      "Bash(pip show:*)",
+      "WebFetch(domain:eqlazhost.com)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
