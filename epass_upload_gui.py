@@ -46,6 +46,7 @@ def resource_path(filename):
 
 REPORT_DIR      = os.path.join(BASE_DIR, "Report")
 LOG_DIR         = os.path.join(BASE_DIR, "Log")
+ARCHIVE_DIR     = os.path.join(BASE_DIR, "Archive")
 CONFIG_PATH     = os.path.join(BASE_DIR, "config.ini")
 LOG_FILE_PATH   = os.path.join(LOG_DIR, "upload.log")
 
@@ -69,6 +70,13 @@ def _file_log(msg):
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 _CONFIG_TEMPLATE = """\
+[LoginDB]
+host     = 127.0.0.1
+port     = 3306
+database =
+username = root
+password =
+
 [DB]
 host     = 127.0.0.1
 port     = 3306
@@ -90,6 +98,15 @@ base_url = https://example.com/eclabapi
 epass_folder =
 gc_folder    =
 run_time     = 08:00
+
+[Email]
+smtp_host    = smtp.gmail.com
+smtp_port    = 587
+username     =
+password     =
+sender_name  = ePass TP Upload
+sender_email =
+use_tls      = true
 """
 
 
@@ -107,6 +124,18 @@ def _read_config():
     cfg = configparser.ConfigParser()
     cfg.read(CONFIG_PATH, encoding="utf-8")
     return cfg
+
+
+def load_login_db_config():
+    cfg = _read_config()
+    sec = cfg["LoginDB"]
+    return {
+        "host":     sec.get("host",     "127.0.0.1").strip(),
+        "port":     int(sec.get("port", "3306").strip()),
+        "database": sec.get("database", "").strip(),
+        "username": sec.get("username", "root").strip(),
+        "password": sec.get("password", "").strip(),
+    }
 
 
 def load_db_config():
@@ -153,6 +182,20 @@ def load_schedule_config():
     }
 
 
+def load_email_config():
+    cfg = _read_config()
+    sec = cfg["Email"] if "Email" in cfg else {}
+    return {
+        "smtp_host":    sec.get("smtp_host",    "smtp.gmail.com").strip(),
+        "smtp_port":    int(sec.get("smtp_port", "587").strip()),
+        "username":     sec.get("username",     "").strip(),
+        "password":     sec.get("password",     "").strip(),
+        "sender_name":  sec.get("sender_name",  "ePass TP Upload").strip(),
+        "sender_email": sec.get("sender_email", "").strip(),
+        "use_tls":      sec.get("use_tls",      "true").strip().lower() == "true",
+    }
+
+
 def save_schedule_config(epass_folder, gc_folder, run_time):
     cfg = _read_config()
     if "Schedule" not in cfg:
@@ -191,7 +234,7 @@ def extract_epass_info(text: str):
 
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    # Name is always on the same line as its label
+    # Name — try label line first (Format A)
     m = re.search(r"Name[ \t]*:[ \t]*(.+)", text)
     if m:
         name = m.group(1).strip()
@@ -215,6 +258,14 @@ def extract_epass_info(text: str):
                     nationality = remaining[1]
                 elif len(remaining) == 1:
                     passport_no = remaining[0]
+
+            # Format B name fallback: walk backwards from the gender line,
+            # skip label lines (contain ':') and lines that start with a digit
+            if not name:
+                for prev in reversed(lines[:i]):
+                    if prev and ":" not in prev and not re.match(r'^\d', prev):
+                        name = prev
+                        break
             break
 
     if passport_from_label:
@@ -500,6 +551,12 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
         # Prefer name from ePass, fall back to GC
         worker_name  = (ep or gc)["name"]
         nationality  = (ep or gc).get("nationality", "")
+
+        # If PDF extraction missed the name, use the listing API's worker_name
+        if worker_name == "UNKNOWN":
+            listing_entry_pre = listing.get(passport_no) if listing else None
+            if listing_entry_pre and listing_entry_pre.get("worker_name"):
+                worker_name = listing_entry_pre["worker_name"]
         name_clean   = sanitize(worker_name)
         pp_clean     = sanitize(passport_no)
 
@@ -520,9 +577,13 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
             "app_no":           "",
             "clab_id":          "",
             "api_timestamp":    "",
-            "epass_api_result": "",
-            "gc_api_result":    "",
-            "error":            "",
+            "epass_api_result":  "",
+            "gc_api_result":     "",
+            "cont_email":        "",
+            "email_status":      "",
+            "epass_local_path":  ep["original_path"] if ep else None,
+            "gc_local_path":     gc["original_path"] if gc else None,
+            "error":             "",
         }
 
         # ── Resolve contractor ID + decide what to upload ────────────────────
@@ -580,6 +641,7 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
                 if ep["original_path"] != new_epass_path:
                     os.rename(ep["original_path"], new_epass_path)
                     log_fn(f"  Renamed ePass → {new_epass_name}\n")
+                record["epass_local_path"] = new_epass_path
                 remote_ep = f"{remote_company_dir}/{new_epass_name}"
                 ftp_upload_file(ftp, new_epass_path, remote_ep, log_fn)
                 epass_remote_path = remote_ep
@@ -593,6 +655,7 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
                 if gc["original_path"] != new_gc_path:
                     os.rename(gc["original_path"], new_gc_path)
                     log_fn(f"  Renamed GC    → {new_gc_name}\n")
+                record["gc_local_path"] = new_gc_path
                 remote_gc = f"{remote_company_dir}/{new_gc_name}"
                 ftp_upload_file(ftp, new_gc_path, remote_gc, log_fn)
                 gc_remote_path = remote_gc
@@ -636,6 +699,7 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
                     record["app_no"]        = record["app_no"]        or parsed.get("App_No",    "")
                     record["clab_id"]       = record["clab_id"]       or parsed.get("CLAB_ID",   "")
                     record["api_timestamp"] = record["api_timestamp"] or parsed.get("TimeStamp", "")
+                    record["cont_email"]    = record["cont_email"]    or parsed.get("Cont_Email", "")
             except Exception as e:
                 record["epass_api_result"] = f"Error: {e}"
                 epass_ok = False
@@ -656,6 +720,7 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
                     record["app_no"]        = record["app_no"]        or parsed.get("App_No",    "")
                     record["clab_id"]       = record["clab_id"]       or parsed.get("CLAB_ID",   "")
                     record["api_timestamp"] = record["api_timestamp"] or parsed.get("TimeStamp", "")
+                    record["cont_email"]    = record["cont_email"]    or parsed.get("Cont_Email", "")
             except Exception as e:
                 record["gc_api_result"] = f"Error: {e}"
                 gc_ok = False
@@ -673,6 +738,9 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
 
     if ftp:
         ftp.quit()
+
+    log_fn("\nArchiving processed files...\n")
+    archive_ts = move_processed_files(records, epass_folder, gc_folder, log_fn)
 
     elapsed     = time.time() - start
     n_success     = sum(1 for r in records if r["status"] == "Success")
@@ -692,20 +760,203 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
         "failures":     n_upload_fail,
         "skipped":      n_skipped,
         "read_errors":  len(errors),
+        "archive_ts":   archive_ts,
         "records":      records,
     }
     done_fn(stats, None)
 
 
+# ─── File Archiving ───────────────────────────────────────────────────────────
+
+def move_processed_files(records, epass_folder, gc_folder, log_fn):
+    """
+    Archive all processed PDFs into:
+      Archive/{timestamp}/Done/ePass/   — successful ePass docs
+      Archive/{timestamp}/Done/GC/      — successful GC docs
+      Archive/{timestamp}/Failed/ePass/ — failed/unmatched ePass docs
+      Archive/{timestamp}/Failed/GC/    — failed/unmatched GC docs
+    Any remaining PDFs not tracked in records (read errors) are caught by a
+    final folder scan and moved to Failed/ as well.
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    done_statuses = {"Success", "Uploaded / API Failed", "Skipped - Already complete"}
+
+    # Pre-build all destination paths
+    dest = {
+        ("done", "epass"): os.path.join(ARCHIVE_DIR, ts, "Done",   "ePass"),
+        ("done", "gc"):    os.path.join(ARCHIVE_DIR, ts, "Done",   "GC"),
+        ("fail", "epass"): os.path.join(ARCHIVE_DIR, ts, "Failed", "ePass"),
+        ("fail", "gc"):    os.path.join(ARCHIVE_DIR, ts, "Failed", "GC"),
+    }
+    for path in dest.values():
+        os.makedirs(path, exist_ok=True)
+
+    counts = {"done": 0, "fail": 0}
+
+    def _move(src, outcome, doc_type):
+        if not src or not os.path.isfile(src):
+            return
+        dst_dir  = dest[(outcome, doc_type)]
+        dst_path = os.path.join(dst_dir, os.path.basename(src))
+        if os.path.exists(dst_path):
+            name, ext = os.path.splitext(os.path.basename(src))
+            dst_path = os.path.join(dst_dir, f"{name}_{ts}{ext}")
+        os.rename(src, dst_path)
+        counts[outcome] += 1
+
+    for r in records:
+        outcome = "done" if r["status"] in done_statuses else "fail"
+        if epass_folder and r.get("epass_local_path"):
+            _move(r["epass_local_path"], outcome, "epass")
+        if gc_folder and r.get("gc_local_path"):
+            _move(r["gc_local_path"], outcome, "gc")
+
+    # Sweep up remaining PDFs not tracked in records (e.g. read errors)
+    for folder, doc_type in [(epass_folder, "epass"), (gc_folder, "gc")]:
+        if not folder or not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            fpath = os.path.join(folder, fname)
+            if fname.lower().endswith(".pdf") and os.path.isfile(fpath):
+                _move(fpath, "fail", doc_type)
+
+    log_fn(f"Archived to Archive/{ts}/  —  "
+           f"{counts['done']} Done,  {counts['fail']} Failed\n")
+    return ts
+
+
+# ─── Email Notification ───────────────────────────────────────────────────────
+
+def _build_email_html(app_no, workers):
+    rows = ""
+    for i, r in enumerate(workers):
+        bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+        epass_cell = ("&#10003;" if r.get("epass_path") else
+                      "Already set" if r.get("needs_epass") is False else "—")
+        gc_cell    = ("&#10003;" if r.get("gc_path") else
+                      "Already set" if r.get("needs_gc") is False else "—")
+        rows += (
+            f'<tr style="background:{bg};">'
+            f'<td style="padding:8px 12px;">{r["worker_name"]}</td>'
+            f'<td style="padding:8px 12px;">{r["passport_no"]}</td>'
+            f'<td style="padding:8px 12px;text-align:center;">{epass_cell}</td>'
+            f'<td style="padding:8px 12px;text-align:center;">{gc_cell}</td>'
+            f'</tr>'
+        )
+    return f"""\
+<html>
+<body style="font-family:Arial,sans-serif;color:#333;background:#f5f5f5;padding:20px;">
+  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;
+              overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+    <div style="background:#0a3d62;color:#fff;padding:24px;">
+      <h2 style="margin:0;">Document Submission Notice</h2>
+      <p style="margin:4px 0 0;opacity:0.8;">Construction Labour Exchange Centre Berhad</p>
+    </div>
+    <div style="padding:24px;">
+      <p>Dear Contractor,</p>
+      <p>The following worker document(s) have been submitted for
+         <strong>Application No: {app_no}</strong>:</p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+        <thead>
+          <tr style="background:#0a3d62;color:#fff;">
+            <th style="padding:10px 12px;text-align:left;">Worker Name</th>
+            <th style="padding:10px 12px;text-align:left;">Passport No</th>
+            <th style="padding:10px 12px;text-align:center;">ePass</th>
+            <th style="padding:10px 12px;text-align:center;">GC / TP</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p style="color:#666;font-size:13px;">
+        This is an automated notification. Please do not reply to this email.
+      </p>
+    </div>
+    <div style="background:#f0f2f5;padding:16px;text-align:center;
+                font-size:12px;color:#888;">
+      Construction Labour Exchange Centre Berhad (CLAB)
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def send_client_emails(records, log_fn):
+    """Send one email per unique App_No, skipping duplicates and missing emails."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from collections import defaultdict
+
+    try:
+        email_cfg = load_email_config()
+    except Exception as e:
+        log_fn(f"  Email skipped — could not load config: {e}\n")
+        return
+
+    if not email_cfg["username"] or not email_cfg["sender_email"]:
+        log_fn("  Email skipped — SMTP credentials not configured in config.ini.\n")
+        return
+
+    # Group successful records by App_No; skip records with no app_no or no email
+    by_app = defaultdict(list)
+    for r in records:
+        app_no     = r.get("app_no", "").strip()
+        cont_email = r.get("cont_email", "").strip()
+        if r["status"] == "Success":
+            if not app_no:
+                r["email_status"] = "No App No"
+            elif not cont_email:
+                r["email_status"] = "No email"
+            else:
+                by_app[app_no].append(r)
+
+    if not by_app:
+        log_fn("  Email skipped — no successful records with App No and contractor email.\n")
+        return
+
+    log_fn(f"\nSending email notifications ({len(by_app)} application(s))...\n")
+    try:
+        smtp = smtplib.SMTP(email_cfg["smtp_host"], email_cfg["smtp_port"], timeout=30)
+        if email_cfg["use_tls"]:
+            smtp.starttls()
+        smtp.login(email_cfg["username"], email_cfg["password"])
+
+        for app_no, workers in by_app.items():
+            cont_email = workers[0]["cont_email"].strip()
+            try:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = f"Document Submission — Application {app_no}"
+                msg["From"]    = f"{email_cfg['sender_name']} <{email_cfg['sender_email']}>"
+                msg["To"]      = cont_email
+                msg.attach(MIMEText(_build_email_html(app_no, workers), "html"))
+                smtp.sendmail(email_cfg["sender_email"], cont_email, msg.as_string())
+                for r in workers:
+                    r["email_status"] = f"Sent → {cont_email}"
+                log_fn(f"  Email sent → {cont_email}  (App No: {app_no}, {len(workers)} worker(s))\n")
+                _file_log(f"Email sent → {cont_email} App No: {app_no}")
+            except Exception as e:
+                for r in workers:
+                    r["email_status"] = f"Failed: {e}"
+                log_fn(f"  Email FAILED for App No {app_no}: {e}\n")
+                _file_log(f"Email FAILED App No: {app_no} — {e}")
+
+        smtp.quit()
+    except Exception as e:
+        log_fn(f"  Email ERROR: {e}\n")
+        _file_log(f"Email ERROR: {e}")
+
+
 # ─── Excel Report ─────────────────────────────────────────────────────────────
 
-def generate_report(records):
+def generate_report(records, stats=None):
     """
-    Generate a two-sheet Excel report:
-      Sheet 1 — Upload Summary   (one row per worker)
-      Sheet 2 — Read Errors      (PDFs that could not be parsed)
+    Generate a three-sheet Excel report:
+      Sheet 1 — Run Summary      (statistics for the run)
+      Sheet 2 — Upload Summary   (one row per worker)
     Returns the saved report file path.
     """
+    stats = stats or {}
+
     HDR_FILL  = PatternFill("solid", fgColor="0A3D62")
     HDR_FONT  = Font(bold=True, color="FFFFFF", size=10)
     OK_FILL   = PatternFill("solid", fgColor="E8F5E9")
@@ -732,17 +983,117 @@ def generate_report(records):
 
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: Upload Summary ───────────────────────────────────────────────
-    ws1 = wb.active
-    ws1.title = "Upload Summary"
+    # ── Sheet 1: Run Summary ──────────────────────────────────────────────────
+    ws_sum = wb.active
+    ws_sum.title = "Run Summary"
+    ws_sum.column_dimensions["A"].width = 28
+    ws_sum.column_dimensions["B"].width = 35
+
+    SECT_FILL = PatternFill("solid", fgColor="1A5276")
+    SECT_FONT = Font(bold=True, color="FFFFFF", size=10)
+    LBL_FILL  = PatternFill("solid", fgColor="F2F3F4")
+    LBL_FONT  = Font(color="444444", size=10)
+    VAL_FONT  = Font(bold=True, size=10)
+    INDENT    = Alignment(horizontal="left", vertical="center", indent=1)
+
+    def _sum_title(row, text):
+        ws_sum.merge_cells(f"A{row}:B{row}")
+        c = ws_sum.cell(row, 1, text)
+        c.fill      = HDR_FILL
+        c.font      = Font(bold=True, color="FFFFFF", size=14)
+        c.alignment = INDENT
+        ws_sum.row_dimensions[row].height = 30
+
+    def _sum_section(row, text):
+        ws_sum.merge_cells(f"A{row}:B{row}")
+        c = ws_sum.cell(row, 1, text)
+        c.fill      = SECT_FILL
+        c.font      = SECT_FONT
+        c.alignment = INDENT
+        ws_sum.row_dimensions[row].height = 18
+
+    def _sum_row(row, label, value, ok=None):
+        lc = ws_sum.cell(row, 1, label)
+        vc = ws_sum.cell(row, 2, value)
+        lc.fill, lc.font, lc.alignment = LBL_FILL, LBL_FONT, INDENT
+        vc.font, vc.alignment = VAL_FONT, INDENT
+        if ok is True:
+            vc.fill = OK_FILL
+        elif ok is False:
+            vc.fill = FAIL_FILL
+        ws_sum.row_dimensions[row].height = 16
+
+    def _sum_gap(row):
+        ws_sum.row_dimensions[row].height = 6
+
+    # Compute values
+    n_total    = len(records)
+    n_success  = sum(1 for r in records if r["status"] == "Success")
+    n_complete = sum(1 for r in records if r["status"] == "Skipped - Already complete")
+    n_no_db    = sum(1 for r in records if r["status"] == "Skipped - Not in DB")
+    n_no_clab  = sum(1 for r in records if r["status"] == "Skipped - No CLAB ID")
+    n_api_fail = sum(1 for r in records if "API" in r["status"] and r["status"] != "Success")
+    n_up_fail  = sum(1 for r in records if r["status"] == "Failed")
+    n_epass    = sum(1 for r in records if r.get("epass_path"))
+    n_gc       = sum(1 for r in records if r.get("gc_path"))
+    sent_apps  = {r.get("app_no") for r in records
+                  if r.get("email_status", "").startswith("Sent") and r.get("app_no")}
+    fail_apps  = {r.get("app_no") for r in records
+                  if r.get("email_status", "").startswith("Failed") and r.get("app_no")}
+    n_email_na = sum(1 for r in records
+                     if r.get("email_status") in ("No App No", "No email", ""))
+
+    elapsed     = stats.get("elapsed", 0)
+    read_errors = stats.get("read_errors", 0)
+    archive_ts  = stats.get("archive_ts", "")
+    generated   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    r = 1
+    _sum_title(r,   "Run Summary");                                            r += 1
+    _sum_gap(r);                                                               r += 1
+    _sum_section(r, "Run Information");                                        r += 1
+    _sum_row(r, "Generated",       generated);                                 r += 1
+    _sum_row(r, "Elapsed Time",    f"{elapsed:.1f} seconds");                  r += 1
+    _sum_row(r, "Archive Folder",  f"Archive/{archive_ts}" if archive_ts
+                                   else "N/A");                                r += 1
+    _sum_gap(r);                                                               r += 1
+    _sum_section(r, "Processing Results");                                     r += 1
+    _sum_row(r, "Total Workers",         n_total);                             r += 1
+    _sum_row(r, "Success",               n_success,
+             ok=True if n_success > 0 else None);                              r += 1
+    _sum_row(r, "Already Complete",      n_complete);                          r += 1
+    _sum_row(r, "Upload Failed",         n_up_fail,
+             ok=False if n_up_fail > 0 else None);                             r += 1
+    _sum_row(r, "API Failed",            n_api_fail,
+             ok=False if n_api_fail > 0 else None);                            r += 1
+    _sum_row(r, "Skipped (Not in DB)",   n_no_db,
+             ok=False if n_no_db > 0 else None);                               r += 1
+    _sum_row(r, "Skipped (No CLAB ID)",  n_no_clab,
+             ok=False if n_no_clab > 0 else None);                             r += 1
+    _sum_row(r, "Read Errors",           read_errors,
+             ok=False if read_errors > 0 else None);                           r += 1
+    _sum_gap(r);                                                               r += 1
+    _sum_section(r, "Documents Uploaded");                                     r += 1
+    _sum_row(r, "ePass",                 n_epass);                             r += 1
+    _sum_row(r, "GC / TP",              n_gc);                                 r += 1
+    _sum_gap(r);                                                               r += 1
+    _sum_section(r, "Email Notifications");                                    r += 1
+    _sum_row(r, "Applications Emailed",  len(sent_apps),
+             ok=True if sent_apps else None);                                  r += 1
+    _sum_row(r, "Email Failed",          len(fail_apps),
+             ok=False if fail_apps else None);                                 r += 1
+    _sum_row(r, "No Email / App No",     n_email_na);                          r += 1
+
+    # ── Sheet 2: Upload Summary ───────────────────────────────────────────────
+    ws1 = wb.create_sheet("Upload Summary")
     ws1.freeze_panes = "A2"
 
     hdrs1   = ["#", "Passport No", "Worker Name", "Nationality", "Contractor ID",
                "ePass", "GC", "Status", "App No", "CLAB ID", "Timestamp",
-               "ePass API", "GC API", "Error"]
+               "ePass API", "GC API", "Email", "Error"]
     widths1 = [5,   15,            30,             15,            15,
                8,    8,    16,      14,       14,        20,
-               30,         30,       40]
+               30,         30,       30,      40]
     _set_header(ws1, hdrs1, widths1)
 
     def _doc_col(has_file, needed, path):
@@ -786,6 +1137,7 @@ def generate_report(records):
             r.get("api_timestamp", ""),
             epass_api,
             gc_api,
+            r.get("email_status",  ""),
             r["error"],
         ])
         _style_row(ws1, row_idx, len(hdrs1), fill)
@@ -849,8 +1201,9 @@ def _run_headless():
 
     stats = result.get("stats") or {}
     if stats.get("records"):
+        send_client_emails(stats["records"], log_fn)
         try:
-            report_path = generate_report(stats["records"])
+            report_path = generate_report(stats["records"], stats)
             _file_log(f"Report saved: {report_path}")
         except Exception as e:
             _file_log(f"Report error: {e}")
@@ -1133,6 +1486,126 @@ class SchedulerDialog(tk.Toplevel):
                 f"Failed to remove task:\n{e.stderr.decode()}", parent=self)
 
 
+# ─── Login Window ─────────────────────────────────────────────────────────────
+
+class LoginWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ePass TP Upload — Login")
+        self.resizable(False, False)
+        self.result = False
+        self._attempts = 0
+
+        try:
+            self.iconbitmap(resource_path('favicon.ico'))
+        except Exception:
+            pass
+
+        dpi = self.winfo_fpixels('1i')
+        self.tk.call('tk', 'scaling', dpi / 72.0)
+
+        self._build_ui()
+        self._center_window()
+        self.bind("<Return>", lambda e: self._attempt_login())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _center_window(self):
+        self.update_idletasks()
+        w, h = 380, 340
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    def _build_ui(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TButton", padding=6, font=("Inter", 10))
+        style.configure("Login.TButton",
+                        background="#0a3d62", foreground="white",
+                        font=("Inter", 11, "bold"), padding=10)
+        style.map("Login.TButton",
+                  background=[("active", "#0c4a75")])
+
+        # Header
+        hdr = tk.Frame(self, bg="#0a3d62", pady=20)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="ePass TP Upload",
+                 bg="#0a3d62", fg="white",
+                 font=("Inter", 16, "bold")).pack()
+        tk.Label(hdr, text="Construction Labour Exchange Centre Berhad",
+                 bg="#0a3d62", fg="#a8c5da",
+                 font=("Inter", 9)).pack()
+
+        # Form
+        form = tk.Frame(self, bg="#f0f2f5", padx=30, pady=20)
+        form.pack(fill="both", expand=True)
+
+        tk.Label(form, text="Username", bg="#f0f2f5",
+                 font=("Inter", 10)).pack(anchor="w")
+        self._user_var = tk.StringVar()
+        self._user_entry = tk.Entry(form, textvariable=self._user_var,
+                                    font=("Inter", 11), width=28)
+        self._user_entry.pack(fill="x", pady=(2, 12))
+
+        tk.Label(form, text="Password", bg="#f0f2f5",
+                 font=("Inter", 10)).pack(anchor="w")
+        self._pass_var = tk.StringVar()
+        tk.Entry(form, textvariable=self._pass_var, show="•",
+                 font=("Inter", 11), width=28).pack(fill="x", pady=(2, 4))
+
+        self._error_var = tk.StringVar()
+        tk.Label(form, textvariable=self._error_var,
+                 bg="#f0f2f5", fg="#c0392b",
+                 font=("Inter", 9)).pack(anchor="w", pady=(0, 10))
+
+        ttk.Button(form, text="Login", style="Login.TButton",
+                   command=self._attempt_login).pack(fill="x")
+
+        self._user_entry.focus_set()
+
+    def _attempt_login(self):
+        username = self._user_var.get().strip()
+        password = self._pass_var.get()
+
+        if not username:
+            self._error_var.set("Please enter your username.")
+            return
+
+        try:
+            db_cfg = load_login_db_config()
+            conn = pymysql.connect(
+                host=db_cfg["host"],
+                port=db_cfg["port"],
+                user=db_cfg["username"],
+                password=db_cfg["password"],
+                database=db_cfg["database"],
+                connect_timeout=10,
+                charset="utf8mb4",
+            )
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM user WHERE username = %s AND password = %s LIMIT 1",
+                        (username, password),
+                    )
+                    found = cur.fetchone() is not None
+            finally:
+                conn.close()
+        except Exception as e:
+            messagebox.showerror("Database Error",
+                                 f"Could not connect to database:\n{e}", parent=self)
+            return
+
+        if found:
+            self.result = True
+            self.destroy()
+        else:
+            self._attempts += 1
+            self._error_var.set(
+                f"Invalid username or password.  (Attempt {self._attempts})")
+            self._pass_var.set("")
+
+
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -1346,10 +1819,11 @@ class App(tk.Tk):
                 f"{stats['failures']} upload failed."
             )
 
-            # Auto-generate report
+            # Email notifications then report
             if self._records:
+                send_client_emails(self._records, self._log_msg)
                 try:
-                    self._report_path = generate_report(self._records)
+                    self._report_path = generate_report(self._records, stats)
                     self._log_msg(f"Report saved: {os.path.basename(self._report_path)}\n")
                     self._report_btn.config(state="normal")
                 except Exception as e:
@@ -1371,5 +1845,8 @@ if __name__ == "__main__":
     if "--scheduled" in sys.argv:
         _run_headless()
     else:
-        app = App()
-        app.mainloop()
+        login = LoginWindow()
+        login.mainloop()
+        if login.result:
+            app = App()
+            app.mainloop()
