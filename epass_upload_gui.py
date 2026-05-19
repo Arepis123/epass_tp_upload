@@ -104,9 +104,11 @@ smtp_host    = smtp.gmail.com
 smtp_port    = 587
 username     =
 password     =
-sender_name  = ePass TP Upload
-sender_email =
-use_tls      = true
+sender_name      = ePass TP Upload
+sender_email     =
+use_tls          = true
+bcc              =
+test_recipient   =
 """
 
 
@@ -166,9 +168,10 @@ def load_api_config():
     cfg = _read_config()
     base = cfg["API"]["base_url"].strip().rstrip("/")
     return {
-        "epass_endpoint": f"{base}/api_epass_upd.php",
-        "gc_endpoint":    f"{base}/api_tp_upd.php",
-        "list_endpoint":  f"{base}/api_epass.php",
+        "epass_endpoint":    f"{base}/api_epass_upd.php",
+        "gc_endpoint":       f"{base}/api_tp_upd.php",
+        "list_endpoint":     f"{base}/api_epass.php",
+        "tp_list_endpoint":  f"{base}/api_tp.php",
     }
 
 
@@ -192,7 +195,9 @@ def load_email_config():
         "password":     sec.get("password",     "").strip(),
         "sender_name":  sec.get("sender_name",  "ePass TP Upload").strip(),
         "sender_email": sec.get("sender_email", "").strip(),
-        "use_tls":      sec.get("use_tls",      "true").strip().lower() == "true",
+        "use_tls":          sec.get("use_tls",         "true").strip().lower() == "true",
+        "bcc":              sec.get("bcc",             "").strip(),
+        "test_recipient":   sec.get("test_recipient",  "").strip(),
     }
 
 
@@ -211,7 +216,8 @@ def save_schedule_config(epass_folder, gc_folder, run_time):
 
 def extract_epass_info(text: str):
     """
-    Extract (passport_no, name, nationality, vp_no, epass_expiry) from ePass PDF text.
+    Extract (passport_no, name, nationality, vp_no, epass_expiry, year_in_malaysia)
+    from ePass PDF text.
 
     Two PDF layouts exist:
       Format A — value on same line as label:
@@ -225,12 +231,17 @@ def extract_epass_info(text: str):
         MALE
         E5399922                   <- passport
         INDONESIA                  <- nationality
+
+    Year in Malaysia (1-13) appears inside a green triangle at the top right.
+    pdfplumber extracts it as a standalone number between "ePass Holder Information"
+    and "MULTIPLE ENTRY VISA".
     """
-    passport_no  = None
-    name         = None
-    nationality  = None
-    vp_no        = None
-    epass_expiry = None
+    passport_no       = None
+    name              = None
+    nationality       = None
+    vp_no             = None
+    epass_expiry      = None
+    year_in_malaysia  = None
 
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
@@ -279,7 +290,11 @@ def extract_epass_info(text: str):
     if m:
         epass_expiry = m.group(1).strip()
 
-    return passport_no, name, nationality, vp_no, epass_expiry
+    m = re.search(r"MALAYSIA IMMIGRATION\s+([1-9]|1[0-3])\s+MULTIPLE ENTRY VISA", text)
+    if m:
+        year_in_malaysia = m.group(1).strip()
+
+    return passport_no, name, nationality, vp_no, epass_expiry, year_in_malaysia
 
 
 def extract_gc_info(text: str):
@@ -344,6 +359,29 @@ def db_lookup_contractor(passport_no: str, db_cfg: dict):
         conn.close()
 
 
+def db_lookup_company_name(clab_id: str, db_cfg: dict):
+    """Query contractors table for company name by CLAB ID."""
+    conn = pymysql.connect(
+        host=db_cfg["host"],
+        port=db_cfg["port"],
+        user=db_cfg["username"],
+        password=db_cfg["password"],
+        database=db_cfg["database"],
+        connect_timeout=10,
+        charset="utf8mb4",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ctr_comp_name FROM contractors WHERE ctr_clab_no = %s LIMIT 1",
+                (clab_id,)
+            )
+            row = cur.fetchone()
+            return (row[0] or "").strip() if row else ""
+    finally:
+        conn.close()
+
+
 # ─── FTP ──────────────────────────────────────────────────────────────────────
 
 def _ftp_makedirs(ftp, remote_dir, log_fn=None):
@@ -397,17 +435,86 @@ def fetch_listing(list_endpoint, log_fn):
             pp = (item.get("Passport_No") or "").strip()
             if not pp:
                 continue
+            def _empty(val):
+                return val is None or str(val).strip() == ""
+
             listing[pp] = {
-                "needs_epass": item.get("ePASS")       is None,
-                "needs_gc":    item.get("Green_Card")   is None,
+                "needs_epass": _empty(item.get("ePASS")),
+                "needs_gc":    _empty(item.get("Green_Card")),
                 "clab_id":     (item.get("CLAB_ID")     or "").strip(),
-                "worker_name": (item.get("Worker_Name") or "").strip(),
+                "worker_name": re.sub(r'\s+', ' ', (item.get("Worker_Name") or "")).strip(),
             }
         log_fn(f"Listing API: {len(listing)} worker(s) with pending documents.\n\n")
         return listing
     except Exception as e:
         log_fn(f"  WARNING: Listing API unavailable ({e}) — falling back to DB lookup.\n\n")
         return None
+
+
+def fetch_tp_listing(tp_list_endpoint, log_fn):
+    """
+    GET api_tp.php and return {passport_no: {needs_gc, clab_id, worker_name}} dict.
+    Supports "TP" or "Green_Card" as the doc field name.
+    Returns None if the request fails (caller falls back to ePass listing for GC status).
+    """
+    try:
+        resp = requests.get(tp_list_endpoint, timeout=30)
+        data = resp.json()
+        if isinstance(data, dict):
+            data = [data]
+        listing = {}
+        for item in data:
+            pp = (item.get("Passport_No") or "").strip()
+            if not pp:
+                continue
+            def _empty(val):
+                return val is None or str(val).strip() == ""
+            tp_val = item.get("TP") if "TP" in item else item.get("Green_Card")
+            listing[pp] = {
+                "needs_gc":    _empty(tp_val),
+                "clab_id":     (item.get("CLAB_ID")     or "").strip(),
+                "worker_name": re.sub(r'\s+', ' ', (item.get("Worker_Name") or "")).strip(),
+            }
+        log_fn(f"TP Listing API: {len(listing)} worker(s) with pending TP/GC documents.\n\n")
+        return listing
+    except Exception as e:
+        log_fn(f"  WARNING: TP Listing API unavailable ({e}) — using ePass listing for GC status.\n\n")
+        return None
+
+
+def _merge_listings(epass_listing, tp_listing):
+    """
+    Merge ePass and TP listings into a unified dict.
+    - needs_epass: from ePass listing (False if worker absent → already set)
+    - needs_gc:    from TP listing when available; falls back to ePass listing if TP fetch failed
+    Returns None only when both listings failed (triggers DB fallback).
+    """
+    if epass_listing is None and tp_listing is None:
+        return None
+
+    all_pp = set()
+    if epass_listing:
+        all_pp.update(epass_listing)
+    if tp_listing:
+        all_pp.update(tp_listing)
+
+    merged = {}
+    for pp in all_pp:
+        ep  = (epass_listing or {}).get(pp)
+        tp  = (tp_listing    or {}).get(pp)
+        src = ep or tp
+        # If TP listing was fetched successfully but worker absent → GC already set
+        if tp_listing is not None:
+            needs_gc = tp["needs_gc"] if tp else False
+        else:
+            needs_gc = ep["needs_gc"] if ep else False
+        merged[pp] = {
+            "needs_epass": ep["needs_epass"] if ep else False,
+            "needs_gc":    needs_gc,
+            "clab_id":     src.get("clab_id",     ""),
+            "worker_name": src.get("worker_name", ""),
+        }
+    return merged
 
 
 def notify_api(url, params, log_fn):
@@ -418,18 +525,21 @@ def notify_api(url, params, log_fn):
     _file_log(f"  Response : {resp.text}")
 
     parsed = None
+    json_ok = False
     try:
         data = resp.json()
         parsed = data[0] if isinstance(data, list) else data
+        json_ok = True
     except Exception:
         pass
 
-    if parsed:
+    if json_ok and parsed:
         msg = parsed.get("message", resp.text[:200])
         ok  = str(parsed.get("success", "")).lower() == "true"
     else:
-        msg = resp.text[:200]
-        ok  = 200 <= resp.status_code < 300
+        # Non-JSON body (e.g. "Error-trans:") is always treated as a failure
+        msg = resp.text[:200].strip() or f"HTTP {resp.status_code} (no body)"
+        ok  = False
 
     log_fn(f"    → {resp.status_code}: {msg}\n")
     return ok, msg, parsed
@@ -481,17 +591,19 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
         try:
             with pdfplumber.open(fpath) as pdf:
                 text = pdf.pages[0].extract_text() or ""
-            pp, name, nat, vp, expiry = extract_epass_info(text)
+            pp, name, nat, vp, expiry, yr = extract_epass_info(text)
             if not pp:
-                log_fn(f"  WARNING: Could not extract passport from ePass: {fname}\n")
-                errors.append({"file": fname, "type": "ePass", "error": "Passport not found"})
+                log_fn(f"  FAILED: Passport not found in ePass PDF: {fname}\n")
+                errors.append({"file": fname, "type": "ePass", "error": "Passport not found — file skipped"})
+                _file_log(f"FAILED [{fname}]: Passport number could not be extracted")
                 continue
             epass_data[pp] = {
-                "name":          name or "UNKNOWN",
-                "nationality":   nat  or "",
-                "vp_no":         vp   or "",
-                "epass_expiry":  expiry or "",
-                "original_path": fpath,
+                "name":             name or "UNKNOWN",
+                "nationality":      nat  or "",
+                "vp_no":            vp   or "",
+                "epass_expiry":     expiry or "",
+                "year_in_malaysia": yr or "",
+                "original_path":    fpath,
             }
             log_fn(f"  ePass: {pp} — {name}\n")
         except Exception as e:
@@ -505,8 +617,9 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
                 text = pdf.pages[0].extract_text() or ""
             pp, name, nat, expiry = extract_gc_info(text)
             if not pp:
-                log_fn(f"  WARNING: Could not extract passport from GC: {fname}\n")
-                errors.append({"file": fname, "type": "GC", "error": "Passport not found"})
+                log_fn(f"  FAILED: Passport not found in GC PDF: {fname}\n")
+                errors.append({"file": fname, "type": "GC", "error": "Passport not found — file skipped"})
+                _file_log(f"FAILED [{fname}]: Passport number could not be extracted")
                 continue
             gc_data[pp] = {
                 "name":          name or "UNKNOWN",
@@ -524,7 +637,18 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
     total = len(all_passports)
 
     if total == 0:
-        done_fn(None, "No valid PDFs found in the selected folders.")
+        _file_log("No PDFs found in the selected folders — nothing to upload.")
+        done_fn({
+            "records":      [],
+            "total":        0,
+            "success":      0,
+            "skipped":      0,
+            "api_failures": 0,
+            "failures":     0,
+            "read_errors":  len(errors),
+            "elapsed":      time.time() - start,
+            "archive_ts":   "",
+        }, None)
         return
 
     log_fn(f"\nFound {total} unique worker(s). Processing...\n\n")
@@ -534,7 +658,9 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
     # ── Step 4–6: Per-worker: rename → upload → API ───────────────────────────
     # Fetch listing to know which documents each worker still needs
     log_fn("Fetching pending worker list from API...\n")
-    listing = fetch_listing(api_cfg["list_endpoint"], log_fn)
+    epass_listing = fetch_listing(api_cfg["list_endpoint"],    log_fn)
+    tp_listing    = fetch_tp_listing(api_cfg["tp_list_endpoint"], log_fn)
+    listing       = _merge_listings(epass_listing, tp_listing)
 
     log_fn("Connecting to FTP...\n")
     ftp = ftplib.FTP()
@@ -548,17 +674,44 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
         ep   = epass_data.get(passport_no)
         gc   = gc_data.get(passport_no)
 
-        # Prefer name from ePass, fall back to GC
-        worker_name  = (ep or gc)["name"]
+        # Prefer name from ePass, fall back to GC; normalise any double spaces
+        worker_name  = re.sub(r'\s+', ' ', (ep or gc)["name"]).strip()
         nationality  = (ep or gc).get("nationality", "")
 
-        # If PDF extraction missed the name, use the listing API's worker_name
+        # If PDF extraction missed the name, fall back to the listing API's worker_name
         if worker_name == "UNKNOWN":
             listing_entry_pre = listing.get(passport_no) if listing else None
-            if listing_entry_pre and listing_entry_pre.get("worker_name"):
-                worker_name = listing_entry_pre["worker_name"]
+            api_name = (listing_entry_pre or {}).get("worker_name", "")
+            if api_name:
+                worker_name = api_name  # already normalised in fetch_listing
         name_clean   = sanitize(worker_name)
         pp_clean     = sanitize(passport_no)
+        yr           = ep["year_in_malaysia"] if ep else ""
+        yr_suffix    = f" - {yr}Y" if yr else ""
+
+        # ── Rename files early — regardless of upload/API outcome ────────────
+        # Condition: name and passport must be readable; year suffix added if available
+        if worker_name != "UNKNOWN":
+            if ep:
+                _new_ep_name = f"{pp_clean} - {name_clean}{yr_suffix}_ePass.pdf"
+                _new_ep_path = os.path.join(epass_folder, _new_ep_name)
+                if ep["original_path"] != _new_ep_path and os.path.isfile(ep["original_path"]):
+                    try:
+                        os.rename(ep["original_path"], _new_ep_path)
+                        ep["original_path"] = _new_ep_path
+                        log_fn(f"  Renamed ePass → {_new_ep_name}\n")
+                    except Exception as _e:
+                        log_fn(f"  Rename ePass failed: {_e}\n")
+            if gc:
+                _new_gc_name = f"{pp_clean} - {name_clean}{yr_suffix}_GC.pdf"
+                _new_gc_path = os.path.join(gc_folder, _new_gc_name)
+                if gc["original_path"] != _new_gc_path and os.path.isfile(gc["original_path"]):
+                    try:
+                        os.rename(gc["original_path"], _new_gc_path)
+                        gc["original_path"] = _new_gc_path
+                        log_fn(f"  Renamed GC    → {_new_gc_name}\n")
+                    except Exception as _e:
+                        log_fn(f"  Rename GC failed: {_e}\n")
 
         log_fn(f"[{idx}/{total}] {passport_no} — {worker_name}\n")
 
@@ -579,8 +732,10 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
             "api_timestamp":    "",
             "epass_api_result":  "",
             "gc_api_result":     "",
+            "comp_name":         "",
             "cont_email":        "",
             "email_status":      "",
+            "year_in_malaysia":  ep["year_in_malaysia"] if ep else "",
             "epass_local_path":  ep["original_path"] if ep else None,
             "gc_local_path":     gc["original_path"] if gc else None,
             "error":             "",
@@ -623,6 +778,10 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
         record["contractor_id"] = contractor_id
         record["needs_epass"]   = needs_epass
         record["needs_gc"]      = needs_gc
+        try:
+            record["comp_name"] = db_lookup_company_name(contractor_id, db_cfg)
+        except Exception:
+            record["comp_name"] = ""
         log_fn(f"  Contractor : {contractor_id}\n")
         log_fn(f"  Needs ePass: {'Yes' if needs_epass else 'No (already set)'}\n")
         log_fn(f"  Needs GC   : {'Yes' if needs_gc    else 'No (already set)'}\n")
@@ -636,28 +795,20 @@ def run_processing(epass_folder, gc_folder, db_cfg, ftp_cfg, api_cfg,
             _ftp_makedirs(ftp, remote_company_dir, log_fn)
 
             if ep and needs_epass:
-                new_epass_name = f"{pp_clean} - {name_clean}_ePass.pdf"
-                new_epass_path = os.path.join(epass_folder, new_epass_name)
-                if ep["original_path"] != new_epass_path:
-                    os.rename(ep["original_path"], new_epass_path)
-                    log_fn(f"  Renamed ePass → {new_epass_name}\n")
-                record["epass_local_path"] = new_epass_path
-                remote_ep = f"{remote_company_dir}/{new_epass_name}"
-                ftp_upload_file(ftp, new_epass_path, remote_ep, log_fn)
+                epass_local = ep["original_path"]
+                record["epass_local_path"] = epass_local
+                remote_ep = f"{remote_company_dir}/{os.path.basename(epass_local)}"
+                ftp_upload_file(ftp, epass_local, remote_ep, log_fn)
                 epass_remote_path = remote_ep
                 record["epass_path"] = remote_ep
             elif ep:
                 log_fn(f"  ePass already set in DB — skipping upload.\n")
 
             if gc and needs_gc:
-                new_gc_name = f"{pp_clean} - {name_clean}_GC.pdf"
-                new_gc_path = os.path.join(gc_folder, new_gc_name)
-                if gc["original_path"] != new_gc_path:
-                    os.rename(gc["original_path"], new_gc_path)
-                    log_fn(f"  Renamed GC    → {new_gc_name}\n")
-                record["gc_local_path"] = new_gc_path
-                remote_gc = f"{remote_company_dir}/{new_gc_name}"
-                ftp_upload_file(ftp, new_gc_path, remote_gc, log_fn)
+                gc_local = gc["original_path"]
+                record["gc_local_path"] = gc_local
+                remote_gc = f"{remote_company_dir}/{os.path.basename(gc_local)}"
+                ftp_upload_file(ftp, gc_local, remote_gc, log_fn)
                 gc_remote_path = remote_gc
                 record["gc_path"] = remote_gc
             elif gc:
@@ -779,17 +930,14 @@ def move_processed_files(records, epass_folder, gc_folder, log_fn):
     final folder scan and moved to Failed/ as well.
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    done_statuses = {"Success", "Uploaded / API Failed", "Skipped - Already complete"}
+    done_statuses = {"Success", "Skipped - Already complete"}
 
-    # Pre-build all destination paths
     dest = {
         ("done", "epass"): os.path.join(ARCHIVE_DIR, ts, "Done",   "ePass"),
         ("done", "gc"):    os.path.join(ARCHIVE_DIR, ts, "Done",   "GC"),
         ("fail", "epass"): os.path.join(ARCHIVE_DIR, ts, "Failed", "ePass"),
         ("fail", "gc"):    os.path.join(ARCHIVE_DIR, ts, "Failed", "GC"),
     }
-    for path in dest.values():
-        os.makedirs(path, exist_ok=True)
 
     counts = {"done": 0, "fail": 0}
 
@@ -797,6 +945,7 @@ def move_processed_files(records, epass_folder, gc_folder, log_fn):
         if not src or not os.path.isfile(src):
             return
         dst_dir  = dest[(outcome, doc_type)]
+        os.makedirs(dst_dir, exist_ok=True)
         dst_path = os.path.join(dst_dir, os.path.basename(src))
         if os.path.exists(dst_path):
             name, ext = os.path.splitext(os.path.basename(src))
@@ -849,12 +998,12 @@ def _build_email_html(app_no, workers):
   <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;
               overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
     <div style="background:#0a3d62;color:#fff;padding:24px;">
-      <h2 style="margin:0;">Document Submission Notice</h2>
+      <h2 style="margin:0;">Document Uploaded Notice</h2>
       <p style="margin:4px 0 0;opacity:0.8;">Construction Labour Exchange Centre Berhad</p>
     </div>
     <div style="padding:24px;">
       <p>Dear Contractor,</p>
-      <p>The following worker document(s) have been submitted for
+      <p>The following worker document(s) are now available for download for
          <strong>Application No: {app_no}</strong>:</p>
       <table style="width:100%;border-collapse:collapse;margin:16px 0;">
         <thead>
@@ -897,6 +1046,10 @@ def send_client_emails(records, log_fn):
         log_fn("  Email skipped — SMTP credentials not configured in config.ini.\n")
         return
 
+    test_recipient = email_cfg["test_recipient"]
+    if test_recipient:
+        log_fn(f"  [TEST MODE] All emails will be redirected to: {test_recipient}\n")
+
     # Group successful records by App_No; skip records with no app_no or no email
     by_app = defaultdict(list)
     for r in records:
@@ -905,7 +1058,7 @@ def send_client_emails(records, log_fn):
         if r["status"] == "Success":
             if not app_no:
                 r["email_status"] = "No App No"
-            elif not cont_email:
+            elif not cont_email and not test_recipient:
                 r["email_status"] = "No email"
             else:
                 by_app[app_no].append(r)
@@ -922,14 +1075,17 @@ def send_client_emails(records, log_fn):
         smtp.login(email_cfg["username"], email_cfg["password"])
 
         for app_no, workers in by_app.items():
-            cont_email = workers[0]["cont_email"].strip()
+            cont_email = test_recipient or workers[0]["cont_email"].strip()
             try:
                 msg = MIMEMultipart("alternative")
-                msg["Subject"] = f"Document Submission — Application {app_no}"
+                msg["Subject"] = f"Document Uploaded — Application {app_no}"
                 msg["From"]    = f"{email_cfg['sender_name']} <{email_cfg['sender_email']}>"
                 msg["To"]      = cont_email
+                if email_cfg["bcc"]:
+                    msg["Bcc"] = email_cfg["bcc"]
                 msg.attach(MIMEText(_build_email_html(app_no, workers), "html"))
-                smtp.sendmail(email_cfg["sender_email"], cont_email, msg.as_string())
+                recipients = [cont_email] + ([email_cfg["bcc"]] if email_cfg["bcc"] else [])
+                smtp.sendmail(email_cfg["sender_email"], recipients, msg.as_string())
                 for r in workers:
                     r["email_status"] = f"Sent → {cont_email}"
                 log_fn(f"  Email sent → {cont_email}  (App No: {app_no}, {len(workers)} worker(s))\n")
@@ -948,7 +1104,7 @@ def send_client_emails(records, log_fn):
 
 # ─── Excel Report ─────────────────────────────────────────────────────────────
 
-def generate_report(records, stats=None):
+def generate_report(records, stats=None, generated_by=""):
     """
     Generate a three-sheet Excel report:
       Sheet 1 — Run Summary      (statistics for the run)
@@ -1053,6 +1209,7 @@ def generate_report(records, stats=None):
     _sum_gap(r);                                                               r += 1
     _sum_section(r, "Run Information");                                        r += 1
     _sum_row(r, "Generated",       generated);                                 r += 1
+    _sum_row(r, "Generated By",   generated_by or "—");                        r += 1
     _sum_row(r, "Elapsed Time",    f"{elapsed:.1f} seconds");                  r += 1
     _sum_row(r, "Archive Folder",  f"Archive/{archive_ts}" if archive_ts
                                    else "N/A");                                r += 1
@@ -1089,11 +1246,11 @@ def generate_report(records, stats=None):
     ws1.freeze_panes = "A2"
 
     hdrs1   = ["#", "Passport No", "Worker Name", "Nationality", "Contractor ID",
-               "ePass", "GC", "Status", "App No", "CLAB ID", "Timestamp",
-               "ePass API", "GC API", "Email", "Error"]
+               "Company", "Year in MY", "ePass", "GC", "Status", "App No", "CLAB ID",
+               "Timestamp", "ePass API", "GC API", "Email", "Error"]
     widths1 = [5,   15,            30,             15,            15,
-               8,    8,    16,      14,       14,        20,
-               30,         30,       30,      40]
+               30,       12,           8,      8,    16,      14,       14,
+               20,          30,         30,       30,      40]
     _set_header(ws1, hdrs1, widths1)
 
     def _doc_col(has_file, needed, path):
@@ -1129,6 +1286,8 @@ def generate_report(records, stats=None):
             r["worker_name"],
             r["nationality"],
             r["contractor_id"] or "",
+            r.get("comp_name", ""),
+            r.get("year_in_malaysia", ""),
             _doc_col(r["has_epass"], r.get("needs_epass"), r["epass_path"]),
             _doc_col(r["has_gc"],    r.get("needs_gc"),    r["gc_path"]),
             r["status"],
@@ -1203,7 +1362,7 @@ def _run_headless():
     if stats.get("records"):
         send_client_emails(stats["records"], log_fn)
         try:
-            report_path = generate_report(stats["records"], stats)
+            report_path = generate_report(stats["records"], stats, "Server")
             _file_log(f"Report saved: {report_path}")
         except Exception as e:
             _file_log(f"Report error: {e}")
@@ -1494,6 +1653,7 @@ class LoginWindow(tk.Tk):
         self.title("ePass TP Upload — Login")
         self.resizable(False, False)
         self.result = False
+        self.logged_in_name = ""
         self._attempts = 0
 
         try:
@@ -1585,10 +1745,13 @@ class LoginWindow(tk.Tk):
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT 1 FROM user WHERE username = %s AND password = %s LIMIT 1",
+                        "SELECT name FROM user WHERE username = %s AND password = %s LIMIT 1",
                         (username, password),
                     )
-                    found = cur.fetchone() is not None
+                    row = cur.fetchone()
+                    found = row is not None
+                    if found:
+                        self.logged_in_name = (row[0] or "").strip() or username
             finally:
                 conn.close()
         except Exception as e:
@@ -1609,13 +1772,14 @@ class LoginWindow(tk.Tk):
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, logged_in_name=""):
         super().__init__()
         self.title("ePass TP Upload")
         self.resizable(False, False)
         self._running       = False
         self._records       = []
         self._report_path   = None
+        self._logged_in_name = logged_in_name
         _ensure_config()
 
         try:
@@ -1823,7 +1987,7 @@ class App(tk.Tk):
             if self._records:
                 send_client_emails(self._records, self._log_msg)
                 try:
-                    self._report_path = generate_report(self._records, stats)
+                    self._report_path = generate_report(self._records, stats, self._logged_in_name)
                     self._log_msg(f"Report saved: {os.path.basename(self._report_path)}\n")
                     self._report_btn.config(state="normal")
                 except Exception as e:
@@ -1848,5 +2012,5 @@ if __name__ == "__main__":
         login = LoginWindow()
         login.mainloop()
         if login.result:
-            app = App()
+            app = App(login.logged_in_name)
             app.mainloop()

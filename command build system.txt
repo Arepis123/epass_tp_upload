@@ -1,0 +1,1 @@
+pyinstaller ePassTPUpload.spec --clean -y 2>&1
